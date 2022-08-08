@@ -23,6 +23,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
@@ -38,6 +39,8 @@ import org.jenkinsci.plugins.workflow.graphanalysis.LinearBlockHoppingScanner;
 @SuppressFBWarnings("SE_INNER_CLASS")
 public class TimeoutStepExecution extends AbstractStepExecutionImpl {
 
+    private static final ReentrantLock LOCK = new ReentrantLock();
+
     private static final Logger LOGGER = Logger.getLogger(TimeoutStepExecution.class.getName());
     private static final long GRACE_PERIOD = Main.isUnitTest ? /* 5s */5_000 : /* 1m */60_000;
 
@@ -45,6 +48,7 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
     public static /* not final */ boolean forceInterruption = SystemProperties.getBoolean(TimeoutStepExecution.class.getName() + ".forceInterruption");
 
     private BodyExecution body;
+
     private transient ScheduledFuture<?> killer;
 
     private long timeout;
@@ -81,7 +85,13 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
             bodyInvoker = bodyInvoker.withContext(
                     BodyInvoker.mergeConsoleLogFilters(
                             context.get(ConsoleLogFilter.class),
-                            new ConsoleLogFilterImpl2(id, timeout)
+                            new ConsoleLogFilterImpl2(id, timeout, () -> {
+                                if (killer == null) {
+                                    return null;
+                                } else {
+                                    return killer.getDelay(TimeUnit.MILLISECONDS);
+                                }
+                            })
                     )
             );
         }
@@ -192,11 +202,15 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
                 }, MoreExecutors.newDirectExecutorService());
             }
         } else {
-            listener().getLogger().println("Cancelling nested steps due to timeout");
-            body.cancel(new ExceededTimeout(nodeId));
-            forcible = true;
-            timeout = GRACE_PERIOD;
-            resetTimer();
+            if (LOCK.isLocked()) {
+                listener().getLogger().println("Reset timer in progress, skip cancel next steps");
+            } else {
+                listener().getLogger().println("Cancelling nested steps due to timeout");
+                body.cancel(new ExceededTimeout(nodeId));
+                forcible = true;
+                timeout = GRACE_PERIOD;
+                resetTimer();
+            }
         }
     }
 
@@ -323,9 +337,12 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
         private final long timeout;
         private transient @CheckForNull Channel channel;
 
-        ConsoleLogFilterImpl2(@NonNull String id, long timeout) {
+        private final SerializableSupplier<Long> killerDelaySupplier;
+
+        ConsoleLogFilterImpl2(@NonNull String id, long timeout, SerializableSupplier<Long> killerDelaySupplier) {
             this.id = id;
             this.timeout = timeout;
+            this.killerDelaySupplier = killerDelaySupplier;
         }
 
         private Object readResolve() {
@@ -357,7 +374,7 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
                     logger.close();
                 }
             };
-            new Tick(active, new WeakReference<>(decorated), timeout, channel, id).schedule();
+            new Tick(active, new WeakReference<>(decorated), timeout, channel, id, killerDelaySupplier).schedule();
             return decorated;
         }
     }
@@ -368,42 +385,56 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
         private final long timeout;
         private final @CheckForNull Channel channel;
         private final @NonNull String id;
-        Tick(AtomicBoolean active, Reference<?> stream, long timeout, @CheckForNull Channel channel, @NonNull String id) {
+
+        private final SerializableSupplier<Long> killerDelaySupplier;
+        Tick(AtomicBoolean active, Reference<?> stream, long timeout, @CheckForNull Channel channel, @NonNull String id, SerializableSupplier<Long> killerDelaySupplier) {
             this.active = active;
             this.stream = stream;
             this.timeout = timeout;
             this.channel = channel;
             this.id = id;
+            this.killerDelaySupplier = killerDelaySupplier;
         }
         @Override
         public void run() {
-            if (stream.get() == null) {
+            LOCK.lock();
+            try {
+
+                if (stream.get() == null) {
                 // Not only idle but gone—stop the timer.
                 return;
-            }
-            boolean currentlyActive = active.getAndSet(false);
-            if (currentlyActive) {
-                Callable<Void, RuntimeException> resetTimer = new ResetTimer(id);
-                if (channel != null) {
-                    try {
-                        channel.call(resetTimer);
-                    } catch (Exception x) {
-                        LOGGER.log(Level.WARNING, null, x);
-                    }
-                } else {
-                    resetTimer.call();
                 }
-                schedule();
-            } else {
-                // Idle at the moment, but check well before the timeout expires in case new output appears.
-                schedule(timeout / 10);
+                boolean currentlyActive = active.getAndSet(false);
+                if (currentlyActive) {
+                    Callable<Void, RuntimeException> resetTimer = new ResetTimer(id);
+                    if (channel != null) {
+                        try {
+                            channel.call(resetTimer);
+                        } catch (Exception x) {
+                            LOGGER.log(Level.WARNING, null, x);
+                        }
+                    } else {
+                        resetTimer.call();
+                    }
+                    schedule();
+                } else {
+                    // Idle at the moment, but check well before the timeout expires in case new output appears.
+                    schedule(timeout / 10);
+                }
+            } finally {
+                LOCK.unlock();
             }
         }
         void schedule() {
-            schedule(timeout / 2); // less than the full timeout, to give some grace period, but in the same ballpark to avoid overhead
+            LOGGER.warning("Timeout: " + timeout + " , killer: " + killerDelaySupplier.get());
+            long newTimeout = timeout / 2;
+            if (killerDelaySupplier.get() != null && killerDelaySupplier.get() < newTimeout) {
+                newTimeout = killerDelaySupplier.get(); // to start Tick 50ms earlier then killer
+            }
+            schedule(newTimeout); // less than the full timeout, to give some grace period, but in the same ballpark to avoid overhead
         }
         private void schedule(long delay) {
-            Timer.get().schedule(this, delay, TimeUnit.MILLISECONDS);
+            ScheduledFuture<?> schedule = Timer.get().schedule(this, delay, TimeUnit.MILLISECONDS);
         }
     }
 
