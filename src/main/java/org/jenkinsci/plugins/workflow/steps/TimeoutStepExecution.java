@@ -340,9 +340,6 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
             OutputStream decorated = new LineTransformationOutputStream() {
                 @Override
                 protected void eol(byte[] b, int len) throws IOException {
-                    if (channel == null) {
-                        new ResetTimer(id).call();
-                    }
                     logger.write(b, 0, len);
                     active.set(true);
                 }
@@ -359,9 +356,7 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
                     logger.close();
                 }
             };
-            if (channel != null) {
-                new Tick(active, new WeakReference<>(decorated), timeout, channel, id).schedule();
-            }
+            new Tick(active, new WeakReference<>(decorated), timeout, channel, id).schedule(0);
             return decorated;
         }
     }
@@ -397,14 +392,11 @@ public class TimeoutStepExecution extends AbstractStepExecutionImpl {
                 } else {
                     resetTimer.call();
                 }
-                schedule();
+                schedule(timeout / 2);
             } else {
                 // Idle at the moment, but check well before the timeout expires in case new output appears.
                 schedule(timeout / 10);
             }
-        }
-        void schedule() {
-            schedule(timeout / 2); // less than the full timeout, to give some grace period, but in the same ballpark to avoid overhead
         }
         private void schedule(long delay) {
             Timer.get().schedule(this, delay, TimeUnit.MILLISECONDS);
